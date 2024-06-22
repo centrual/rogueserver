@@ -6,6 +6,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'pagefaultgames/rogueserver'
     name: Build (${{ matrix.os_name }})
     env:
       GO_VERSION: 1.22
