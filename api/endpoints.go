@@ -19,11 +19,15 @@ package api
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/pagefaultgames/rogueserver/api/account"
 	"github.com/pagefaultgames/rogueserver/api/daily"
@@ -37,7 +41,6 @@ import (
 	Handler functions are responsible for checking the validity of this data and returning a result or error.
 	Handlers should not return serialized JSON, instead return the struct itself.
 */
-
 // account
 
 func handleAccountInfo(w http.ResponseWriter, r *http.Request) {
@@ -52,13 +55,31 @@ func handleAccountInfo(w http.ResponseWriter, r *http.Request) {
 		httpError(w, r, err, http.StatusInternalServerError)
 		return
 	}
+	discordId, err := db.FetchDiscordIdByUsername(username)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			httpError(w, r, err, http.StatusInternalServerError)
+			return
+		}
+	}
+	googleId, err := db.FetchGoogleIdByUsername(username)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			httpError(w, r, err, http.StatusInternalServerError)
+			return
+		}
+	}
 
-	response, err := account.Info(username, uuid)
+	var hasAdminRole bool
+	if discordId != "" {
+		hasAdminRole, _ = account.IsUserDiscordAdmin(discordId, account.DiscordGuildID)
+	}
+
+	response, err := account.Info(username, discordId, googleId, uuid, hasAdminRole)
 	if err != nil {
 		httpError(w, r, err, http.StatusInternalServerError)
 		return
 	}
-
 	writeJSON(w, r, response)
 }
 
@@ -542,4 +563,143 @@ func handleDailyRankingPageCount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write([]byte(strconv.Itoa(count)))
+}
+
+// redirect link after authorizing application link
+func handleProviderCallback(w http.ResponseWriter, r *http.Request) {
+	provider := r.PathValue("provider")
+	state := r.URL.Query().Get("state")
+	var externalAuthId string
+	var err error
+	switch provider {
+	case "discord":
+		externalAuthId, err = account.HandleDiscordCallback(w, r)
+	case "google":
+		externalAuthId, err = account.HandleGoogleCallback(w, r)
+	default:
+		http.Error(w, "invalid provider", http.StatusBadRequest)
+		return
+	}
+
+	if err != nil {
+		httpError(w, r, err, http.StatusInternalServerError)
+		return
+	}
+
+	if state != "" {
+		state = strings.Replace(state, " ", "+", -1)
+		stateByte, err := base64.StdEncoding.DecodeString(state)
+		if err != nil {
+			http.Redirect(w, r, account.GameURL, http.StatusSeeOther)
+			return
+		}
+
+		userName, err := db.FetchUsernameBySessionToken(stateByte)
+		if err != nil {
+			http.Redirect(w, r, account.GameURL, http.StatusSeeOther)
+			return
+		}
+
+		switch provider {
+		case "discord":
+			err = db.AddDiscordIdByUsername(externalAuthId, userName)
+		case "google":
+			err = db.AddGoogleIdByUsername(externalAuthId, userName)
+		}
+
+		if err != nil {
+			http.Redirect(w, r, account.GameURL, http.StatusSeeOther)
+			return
+		}
+
+	} else {
+		var userName string
+		switch provider {
+		case "discord":
+			userName, err = db.FetchUsernameByDiscordId(externalAuthId)
+		case "google":
+			userName, err = db.FetchUsernameByGoogleId(externalAuthId)
+		}
+		if err != nil {
+			http.Redirect(w, r, account.GameURL, http.StatusSeeOther)
+			return
+		}
+
+		sessionToken, err := account.GenerateTokenForUsername(userName)
+		if err != nil {
+			http.Redirect(w, r, account.GameURL, http.StatusSeeOther)
+			return
+		}
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     "pokerogue_sessionId",
+			Value:    sessionToken,
+			Path:     "/",
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			Domain:   "pokerogue.net",
+			Expires:  time.Now().Add(time.Hour * 24 * 30 * 3), // 3 months
+		})
+	}
+
+	http.Redirect(w, r, account.GameURL, http.StatusSeeOther)
+}
+
+func handleProviderLogout(w http.ResponseWriter, r *http.Request) {
+	uuid, err := uuidFromRequest(r)
+	if err != nil {
+		httpError(w, r, err, http.StatusBadRequest)
+		return
+	}
+
+	switch r.PathValue("provider") {
+	case "discord":
+		err = db.RemoveDiscordIdByUUID(uuid)
+	case "google":
+		err = db.RemoveGoogleIdByUUID(uuid)
+	default:
+		http.Error(w, "invalid provider", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		httpError(w, r, err, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func handleAdminDiscordLink(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseForm()
+	if err != nil {
+		httpError(w, r, fmt.Errorf("failed to parse request form: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	uuid, err := uuidFromRequest(r)
+	if err != nil {
+		httpError(w, r, err, http.StatusUnauthorized)
+		return
+	}
+
+	userDiscordId, err := db.FetchDiscordIdByUUID(uuid)
+	if err != nil {
+		httpError(w, r, err, http.StatusUnauthorized)
+		return
+	}
+
+	hasRole, err := account.IsUserDiscordAdmin(userDiscordId, account.DiscordGuildID)
+	if !hasRole || err != nil {
+		httpError(w, r, fmt.Errorf("user does not have the required role"), http.StatusForbidden)
+		return
+	}
+
+	err = db.AddDiscordIdByUsername(r.Form.Get("discordId"), r.Form.Get("username"))
+	if err != nil {
+		httpError(w, r, err, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("%s: %s added discord id %s to username %s", r.URL.Path, userDiscordId, r.Form.Get("discordId"), r.Form.Get("username"))
+
+	w.WriteHeader(http.StatusOK)
 }
